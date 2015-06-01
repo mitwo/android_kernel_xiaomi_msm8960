@@ -9,6 +9,10 @@
 #include <linux/uaccess.h>
 #include "internal.h"
 
+#ifdef CONFIG_MACH_APQ8064_ARIES
+extern int aries_is_storage_mounted(void);
+#endif
+
 static int flags_by_mnt(int mnt_flags)
 {
 	int flags = 0;
@@ -81,6 +85,34 @@ int user_statfs(const char __user *pathname, struct kstatfs *st)
 	if (!error) {
 		error = vfs_statfs(&path, st);
 		path_put(&path);
+
+#ifdef CONFIG_MACH_APQ8064_ARIES
+		// hack to show combined storage space in setting
+		if(!error && aries_is_storage_mounted()) {
+			char* kernel_pathname = strndup_user(pathname, PAGE_SIZE);
+			if(!IS_ERR(kernel_pathname)) {
+				if(!strcmp(kernel_pathname, "/data")) {
+					int rc;
+					struct kstatfs st_datamedia;
+					mm_segment_t old_fs = get_fs();
+
+					// get information about mounted storage partition
+					set_fs(KERNEL_DS);
+					rc = user_statfs("/data/media", &st_datamedia);
+					set_fs(old_fs);
+
+					// add storage space to userdata's stats
+					if(!rc) {
+						st->f_blocks += st_datamedia.f_blocks;
+						st->f_bfree += st_datamedia.f_bfree;
+						st->f_bavail += st_datamedia.f_bavail;
+					}
+				}
+
+				kfree(kernel_pathname);
+			}
+		}
+#endif
 	}
 	return error;
 }

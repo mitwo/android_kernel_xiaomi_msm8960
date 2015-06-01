@@ -37,6 +37,13 @@ static struct list_head *mount_hashtable __read_mostly;
 static struct kmem_cache *mnt_cache __read_mostly;
 static struct rw_semaphore namespace_sem;
 
+#ifdef CONFIG_MACH_APQ8064_ARIES
+static int aries_storage_mounted = 0;
+int aries_is_storage_mounted(void) {
+	return aries_storage_mounted!=0;
+}
+#endif
+
 /* /sys/fs */
 struct kobject *fs_kobj;
 EXPORT_SYMBOL_GPL(fs_kobj);
@@ -1215,6 +1222,31 @@ SYSCALL_DEFINE2(umount, char __user *, name, int, flags)
 	if (!capable(CAP_SYS_ADMIN))
 		goto dput_and_out;
 
+#ifdef CONFIG_MACH_APQ8064_ARIES
+	if(!strcmp(mnt->mnt_devname, "/dev/block/mmcblk0p26") || !strcmp(mnt->mnt_devname, "/dev/block/platform/msm_sdcc.1/by-name/userdata")) {
+		static char buf[PATH_MAX];
+		char* kernel_name;
+		mm_segment_t old_fs = get_fs();
+
+		kernel_name = strndup_user(name, PAGE_SIZE);
+		if(!IS_ERR(kernel_name)) {
+			set_fs(KERNEL_DS);
+
+			// unmount bind mount from 0/
+			snprintf(buf, PATH_MAX, "%s/media/0", kernel_name);
+			sys_umount(buf, flags);
+
+			// unmount storage from media/
+			snprintf(buf, PATH_MAX, "%s/media", kernel_name);
+			if(!sys_umount(buf, flags))
+				aries_storage_mounted--;
+
+			set_fs(old_fs);
+			kfree(kernel_name);
+		}
+	}
+#endif
+
 	retval = do_umount(mnt, flags);
 dput_and_out:
 	/* we mustn't call path_put() as that would clear mnt_expiry_mark */
@@ -2131,6 +2163,8 @@ long do_mount(char *dev_name, char *dir_name, char *type_page,
 	struct path path;
 	int retval = 0;
 	int mnt_flags = 0;
+	char* data_page_backup = NULL;
+	int mnt_flags_backup = flags;
 
 	/* Discard magic */
 	if ((flags & MS_MGC_MSK) == MS_MGC_VAL)
@@ -2141,13 +2175,20 @@ long do_mount(char *dev_name, char *dir_name, char *type_page,
 	if (!dir_name || !*dir_name || !memchr(dir_name, 0, PAGE_SIZE))
 		return -EINVAL;
 
-	if (data_page)
+	if (!(data_page_backup = (char*)__get_free_page(GFP_KERNEL)))
+		return -EINVAL;
+	data_page_backup[0] = '\0';
+
+	if (data_page) {
 		((char *)data_page)[PAGE_SIZE - 1] = 0;
+
+		memcpy(data_page_backup, data_page, PAGE_SIZE);
+	}
 
 	/* ... and get the mountpoint */
 	retval = kern_path(dir_name, LOOKUP_FOLLOW, &path);
 	if (retval)
-		return retval;
+		goto freepage_out;
 
 	retval = security_sb_mount(dev_name, &path,
 				   type_page, flags, data_page);
@@ -2190,8 +2231,51 @@ long do_mount(char *dev_name, char *dir_name, char *type_page,
 	else
 		retval = do_new_mount(&path, type_page, flags, mnt_flags,
 				      dev_name, data_page);
+
+#ifdef CONFIG_MACH_APQ8064_ARIES
+	if(retval==0 && (!strcmp(dev_name, "/dev/block/mmcblk0p26") || !strcmp(dev_name, "/dev/block/platform/msm_sdcc.1/by-name/userdata"))) {
+		unsigned len = 0;
+		static char buf[PATH_MAX];
+		const char* mountcontext = ",context=u:object_r:media_rw_data_file:s0";
+
+		mm_segment_t old_fs = get_fs();
+		set_fs(KERNEL_DS);
+
+		// mount storage to media/
+		snprintf(buf, PATH_MAX, "%s/media", dir_name);
+		sys_mkdir(buf, 0770);
+		sys_chown(buf, 1023, 1023);
+
+		// get current length
+		len = strlen(data_page_backup);
+
+		// append context
+		if(len + strlen(mountcontext) < PAGE_SIZE)
+			memcpy(data_page_backup+len, mountcontext, strlen(mountcontext)+1);
+
+		// assume that storage has the same filesystem
+		if(!do_mount("/dev/block/platform/msm_sdcc.1/by-name/storage", buf, type_page, mnt_flags_backup, data_page_backup)) {
+			static char buf2[PATH_MAX];
+
+			// bind mount media/ to media/0/
+			snprintf(buf2, PATH_MAX, "%s/media/0", dir_name);
+			sys_mkdir(buf2, 0770);
+			sys_chown(buf2, 1023, 1023);
+			sys_mount(buf, buf2, NULL, MS_BIND|MS_SILENT, NULL);
+
+			aries_storage_mounted++;
+		}
+
+		set_fs(old_fs);
+	}
+#endif
+
 dput_out:
 	path_put(&path);
+freepage_out:
+	if(data_page_backup)
+		free_page((unsigned long)data_page_backup);
+	
 	return retval;
 }
 
